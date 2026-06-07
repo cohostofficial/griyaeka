@@ -2,19 +2,16 @@
 
 import { useEffect, useState } from 'react'
 import { createClient } from '@/lib/supabase/client'
-import { format, startOfMonth, endOfMonth } from 'date-fns'
+import { format } from 'date-fns'
 import { id } from 'date-fns/locale'
 
-// ─────────────────────────────────────────────
-// Types
-// ─────────────────────────────────────────────
 interface Attendance {
   id: string
   check_in_time: string
   check_out_time: string | null
   total_hours: number | null
   status: string
-  selfie_in_url: string | null   // storage path, e.g. "user-id/in-123.jpg"
+  selfie_in_url: string | null
   selfie_out_url: string | null
   users: { name: string }
   locations: { name: string }
@@ -23,7 +20,7 @@ interface Attendance {
 interface Employee { id: string; name: string }
 
 interface ModalState {
-  signedUrl: string        // 'loading' | actual signed URL
+  signedUrl: string
   storagePath: string
   attendanceId: string
   field: 'selfie_in_url' | 'selfie_out_url'
@@ -32,48 +29,41 @@ interface ModalState {
   type: 'in' | 'out'
 }
 
-// ─────────────────────────────────────────────
-// Helper: extract storage path dari raw value
-// Mendukung dua format:
-//   1. Path baru  → "user-id/in-123.jpg"
-//   2. URL lama   → "https://xxx.supabase.co/.../selfies/user-id/in-123.jpg"
-// ─────────────────────────────────────────────
 function toStoragePath(raw: string): string | null {
   if (!raw) return null
-  if (!raw.startsWith('http')) return raw          // sudah path
+  if (!raw.startsWith('http')) return raw
   const m = raw.match(/\/selfies\/(.+?)(\?|$)/)
   return m ? m[1] : null
 }
 
-// ─────────────────────────────────────────────
-// Component
-// ─────────────────────────────────────────────
+function todayStr() {
+  const d = new Date()
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+}
+
+function firstOfMonthStr() {
+  const d = new Date()
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-01`
+}
+
 export default function ReportsPage() {
   const supabase = createClient()
 
-  const [attendances, setAttendances]       = useState<Attendance[]>([])
-  const [employees, setEmployees]           = useState<Employee[]>([])
-  const [loading, setLoading]               = useState(false)
+  const [attendances, setAttendances] = useState<Attendance[]>([])
+  const [employees, setEmployees]     = useState<Employee[]>([])
+  const [loading, setLoading]         = useState(false)
   const [selectedEmployee, setSelectedEmployee] = useState('')
-  const [selectedMonth, setSelectedMonth]   = useState(format(new Date(), 'yyyy-MM'))
+  const [dateFrom, setDateFrom]       = useState(firstOfMonthStr)
+  const [dateTo, setDateTo]           = useState(todayStr)
 
-  // Modal lihat foto
-  const [modal, setModal]                   = useState<ModalState | null>(null)
-
-  // Bulk delete
+  const [modal, setModal]                         = useState<ModalState | null>(null)
   const [showBulkDeleteModal, setShowBulkDeleteModal] = useState(false)
-  const [deleting, setDeleting]             = useState(false)
+  const [deleting, setDeleting]                   = useState(false)
+  const [zipping, setZipping]                     = useState(false)
+  const [toast, setToast]                         = useState<{ ok: boolean; msg: string } | null>(null)
 
-  // Bulk download zip
-  const [zipping, setZipping]              = useState(false)
-
-  // Notifikasi
-  const [toast, setToast]                   = useState<{ ok: boolean; msg: string } | null>(null)
-
-  // ── Load employees ──────────────────────────
   useEffect(() => {
-    supabase
-      .from('users').select('id,name')
+    supabase.from('users').select('id,name')
       .eq('role', 'employee').eq('is_active', true)
       .then(({ data }) => { if (data) setEmployees(data) })
   }, [supabase])
@@ -83,12 +73,13 @@ export default function ReportsPage() {
     setTimeout(() => setToast(null), 4000)
   }
 
-  // ── Load laporan ────────────────────────────
   async function loadReport() {
+    if (!dateFrom || !dateTo) { showToast(false, 'Pilih tanggal dari dan sampai'); return }
+    if (dateFrom > dateTo) { showToast(false, 'Tanggal "dari" tidak boleh lebih besar dari "sampai"'); return }
+
     setLoading(true)
-    const [year, month] = selectedMonth.split('-')
-    const from = startOfMonth(new Date(+year, +month - 1)).toISOString()
-    const to   = endOfMonth(new Date(+year, +month - 1)).toISOString()
+    const from = dateFrom + 'T00:00:00+07:00'
+    const to   = dateTo   + 'T23:59:59+07:00'
 
     let q = supabase
       .from('attendances')
@@ -104,7 +95,6 @@ export default function ReportsPage() {
     setLoading(false)
   }
 
-  // ── Export Excel ────────────────────────────
   async function exportExcel() {
     const { utils, writeFile } = await import('xlsx')
     const rows = attendances.map(a => ({
@@ -114,29 +104,20 @@ export default function ReportsPage() {
       'Jam Pulang': a.check_out_time ? format(new Date(a.check_out_time), 'HH:mm') : '-',
       'Total Jam': a.total_hours?.toFixed(2) ?? '-',
       Lokasi: a.locations.name,
-      Status:
-        a.status === 'present' ? 'Hadir' :
-        a.status === 'late'    ? 'Terlambat' : 'Tidak Lengkap',
+      Status: a.check_in_time ? 'Hadir' : 'Tidak Hadir',
     }))
     const wb = utils.book_new()
     utils.book_append_sheet(wb, utils.json_to_sheet(rows), 'Laporan')
-    writeFile(wb, `Laporan_Absensi_${selectedMonth}.xlsx`)
+    writeFile(wb, `Laporan_${dateFrom}_sd_${dateTo}.xlsx`)
   }
 
-  // ─────────────────────────────────────────────
-  // SELFIE: generate signed URL (1 jam)
-  // ─────────────────────────────────────────────
   async function getSignedUrl(storagePath: string): Promise<string> {
     const { data, error } = await supabase.storage
-      .from('selfies')
-      .createSignedUrl(storagePath, 3600)
+      .from('selfies').createSignedUrl(storagePath, 3600)
     if (error || !data?.signedUrl) throw new Error('Gagal membuat signed URL')
     return data.signedUrl
   }
 
-  // ─────────────────────────────────────────────
-  // SELFIE: buka modal lihat foto
-  // ─────────────────────────────────────────────
   async function openSelfie(att: Attendance, type: 'in' | 'out') {
     const raw = type === 'in' ? att.selfie_in_url : att.selfie_out_url
     if (!raw) return
@@ -144,16 +125,7 @@ export default function ReportsPage() {
     if (!storagePath) { showToast(false, 'Path foto tidak valid'); return }
 
     const field: ModalState['field'] = type === 'in' ? 'selfie_in_url' : 'selfie_out_url'
-
-    setModal({
-      signedUrl: 'loading',
-      storagePath,
-      attendanceId: att.id,
-      field,
-      employeeName: att.users.name,
-      date: att.check_in_time,
-      type,
-    })
+    setModal({ signedUrl: 'loading', storagePath, attendanceId: att.id, field, employeeName: att.users.name, date: att.check_in_time, type })
 
     try {
       const url = await getSignedUrl(storagePath)
@@ -164,9 +136,6 @@ export default function ReportsPage() {
     }
   }
 
-  // ─────────────────────────────────────────────
-  // SELFIE: download satu foto dari modal
-  // ─────────────────────────────────────────────
   async function downloadOneSelfie() {
     if (!modal || modal.signedUrl === 'loading') return
     try {
@@ -174,9 +143,8 @@ export default function ReportsPage() {
       const blob = await res.blob()
       const url  = URL.createObjectURL(blob)
       const a    = document.createElement('a')
-      const dateStr = format(new Date(modal.date), 'yyyy-MM-dd')
       a.href     = url
-      a.download = `selfie_${modal.type === 'in' ? 'masuk' : 'pulang'}_${modal.employeeName.replace(/\s+/g, '_')}_${dateStr}.jpg`
+      a.download = `selfie_${modal.type === 'in' ? 'masuk' : 'pulang'}_${modal.employeeName.replace(/\s+/g, '_')}_${format(new Date(modal.date), 'yyyy-MM-dd')}.jpg`
       a.click()
       URL.revokeObjectURL(url)
     } catch {
@@ -184,11 +152,6 @@ export default function ReportsPage() {
     }
   }
 
-  // ─────────────────────────────────────────────
-  // SELFIE: hapus satu foto dari modal
-  //   → hapus di Storage via API route (service_role)
-  //   → kosongkan kolom di DB
-  // ─────────────────────────────────────────────
   async function deleteOneSelfie() {
     if (!modal || !modal.storagePath) return
     if (!confirm(`Hapus foto selfie ${modal.type === 'in' ? 'masuk' : 'pulang'} milik ${modal.employeeName}?\n\nData absensi tetap tersimpan.`)) return
@@ -202,28 +165,18 @@ export default function ReportsPage() {
       }),
     })
     const data = await res.json()
-
     if (!res.ok || data.errors > 0) {
       showToast(false, `Gagal menghapus foto: ${data.error ?? 'Unknown error'}`)
       return
     }
-
     showToast(true, 'Foto berhasil dihapus dari Supabase Storage')
     setModal(null)
     loadReport()
   }
 
-  // ─────────────────────────────────────────────
-  // SELFIE: download SEMUA foto bulan ini (ZIP)
-  // ─────────────────────────────────────────────
   async function downloadAllSelfiesZip() {
-    const withSelfie = attendances.filter(
-      a => a.selfie_in_url || a.selfie_out_url
-    )
-    if (withSelfie.length === 0) {
-      showToast(false, 'Tidak ada foto selfie di bulan ini')
-      return
-    }
+    const withSelfie = attendances.filter(a => a.selfie_in_url || a.selfie_out_url)
+    if (withSelfie.length === 0) { showToast(false, 'Tidak ada foto selfie di periode ini'); return }
 
     setZipping(true)
     try {
@@ -239,16 +192,12 @@ export default function ReportsPage() {
           if (!raw) continue
           const path = toStoragePath(raw)
           if (!path) continue
-
           try {
             const url  = await getSignedUrl(path)
             const res  = await fetch(url)
             const blob = await res.blob()
-            const filename = `selfie_${type === 'in' ? 'masuk' : 'pulang'}_${name}_${dateStr}.jpg`
-            zip.file(filename, blob)
-          } catch {
-            // skip foto yang gagal
-          }
+            zip.file(`selfie_${type === 'in' ? 'masuk' : 'pulang'}_${name}_${dateStr}.jpg`, blob)
+          } catch { /* skip */ }
         }
       }
 
@@ -256,7 +205,7 @@ export default function ReportsPage() {
       const url     = URL.createObjectURL(content)
       const a       = document.createElement('a')
       a.href        = url
-      a.download    = `Selfie_${selectedMonth}.zip`
+      a.download    = `Selfie_${dateFrom}_sd_${dateTo}.zip`
       a.click()
       URL.revokeObjectURL(url)
       showToast(true, 'Semua foto berhasil diunduh sebagai ZIP')
@@ -267,14 +216,9 @@ export default function ReportsPage() {
     }
   }
 
-  // ─────────────────────────────────────────────
-  // SELFIE: hapus SEMUA foto bulan ini
-  //   → kirim semua path ke API route
-  //   → API hapus di Storage + kosongkan DB
-  // ─────────────────────────────────────────────
   async function bulkDeleteSelfies() {
     setDeleting(true)
-    const paths: string[]       = []
+    const paths: string[] = []
     const dbUpdates: { id: string; fields: Record<string, null> }[] = []
 
     for (const att of attendances) {
@@ -296,52 +240,46 @@ export default function ReportsPage() {
       body: JSON.stringify({ paths, dbUpdates }),
     })
     const data = await res.json()
-
     setDeleting(false)
     setShowBulkDeleteModal(false)
 
     if (!res.ok) {
       showToast(false, `Gagal: ${data.error ?? 'Unknown error'}`)
     } else {
-      showToast(true, `${data.deleted} foto berhasil dihapus dari Supabase Storage${data.errors > 0 ? `, ${data.errors} gagal` : ''}`)
+      showToast(true, `${data.deleted} foto berhasil dihapus${data.errors > 0 ? `, ${data.errors} gagal` : ''}`)
       loadReport()
     }
   }
 
-  // ─────────────────────────────────────────────
-  // Computed values
-  // ─────────────────────────────────────────────
-  const totalHours    = attendances.reduce((s, a) => s + (a.total_hours ?? 0), 0)
-  const presentCount  = attendances.filter(a => a.status === 'present').length
-  const lateCount     = attendances.filter(a => a.status === 'late').length
-  const selfieCount   = attendances.reduce((s, a) =>
+  const totalHours   = attendances.reduce((s, a) => s + (a.total_hours ?? 0), 0)
+  const presentCount = attendances.filter(a => a.check_in_time).length
+  const selfieCount  = attendances.reduce((s, a) =>
     s + (a.selfie_in_url ? 1 : 0) + (a.selfie_out_url ? 1 : 0), 0)
+  const periodLabel  = `${dateFrom} s/d ${dateTo}`
 
-  const monthLabel = format(new Date(selectedMonth + '-01'), 'MMMM yyyy', { locale: id })
-
-  // ─────────────────────────────────────────────
-  // Render
-  // ─────────────────────────────────────────────
   return (
     <div className="space-y-6 pb-20 md:pb-0">
       <div>
         <h1 className="text-xl font-bold text-gray-900">Laporan Absensi</h1>
-        <p className="text-sm text-gray-500">Filter, ekspor, dan kelola foto selfie</p>
+        <p className="text-sm text-gray-500">Filter per rentang tanggal, ekspor, dan kelola foto selfie</p>
       </div>
 
-      {/* ── Filter ── */}
+      {/* Filter */}
       <div className="bg-white rounded-2xl shadow-sm border border-gray-100 p-4">
         <div className="flex flex-wrap gap-3">
-          <div className="flex-1 min-w-36">
-            <label className="block text-xs text-gray-500 font-medium mb-1">Bulan</label>
-            <input type="month" value={selectedMonth}
-              onChange={e => setSelectedMonth(e.target.value)}
+          <div className="flex-1 min-w-32">
+            <label className="block text-xs text-gray-500 font-medium mb-1">Dari Tanggal</label>
+            <input type="date" value={dateFrom} onChange={e => setDateFrom(e.target.value)}
+              className="w-full px-3 py-2 rounded-xl border border-gray-200 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" />
+          </div>
+          <div className="flex-1 min-w-32">
+            <label className="block text-xs text-gray-500 font-medium mb-1">Sampai Tanggal</label>
+            <input type="date" value={dateTo} onChange={e => setDateTo(e.target.value)}
               className="w-full px-3 py-2 rounded-xl border border-gray-200 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" />
           </div>
           <div className="flex-1 min-w-36">
             <label className="block text-xs text-gray-500 font-medium mb-1">Karyawan</label>
-            <select value={selectedEmployee}
-              onChange={e => setSelectedEmployee(e.target.value)}
+            <select value={selectedEmployee} onChange={e => setSelectedEmployee(e.target.value)}
               className="w-full px-3 py-2 rounded-xl border border-gray-200 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
               <option value="">Semua Karyawan</option>
               {employees.map(e => <option key={e.id} value={e.id}>{e.name}</option>)}
@@ -362,14 +300,13 @@ export default function ReportsPage() {
         </div>
       </div>
 
-      {/* ── Tombol aksi selfie (muncul setelah data ada) ── */}
+      {/* Kelola selfie */}
       {attendances.length > 0 && selfieCount > 0 && (
         <div className="bg-white rounded-2xl shadow-sm border border-gray-100 p-4">
           <p className="text-xs text-gray-500 font-medium mb-3">
-            Kelola Foto Selfie · <span className="text-gray-700">{selfieCount} foto</span> di {monthLabel}
+            Kelola Foto Selfie · <span className="text-gray-700">{selfieCount} foto</span> periode {periodLabel}
           </p>
           <div className="flex flex-wrap gap-3">
-            {/* Download semua → ZIP */}
             <button onClick={downloadAllSelfiesZip} disabled={zipping}
               className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-xl text-sm font-semibold hover:bg-blue-700 disabled:opacity-50">
               <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -378,8 +315,6 @@ export default function ReportsPage() {
               </svg>
               {zipping ? 'Membuat ZIP...' : `Download Semua (${selfieCount}) → ZIP`}
             </button>
-
-            {/* Hapus semua */}
             <button onClick={() => setShowBulkDeleteModal(true)}
               className="flex items-center gap-2 px-4 py-2 bg-red-500 text-white rounded-xl text-sm font-semibold hover:bg-red-600">
               <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -389,13 +324,11 @@ export default function ReportsPage() {
               Hapus Semua Selfie ({selfieCount})
             </button>
           </div>
-          <p className="text-xs text-gray-400 mt-2">
-            Download dulu sebelum hapus. Data absensi (jam masuk/pulang) tidak ikut terhapus.
-          </p>
+          <p className="text-xs text-gray-400 mt-2">Download dulu sebelum hapus. Data absensi tidak ikut terhapus.</p>
         </div>
       )}
 
-      {/* ── Toast notifikasi ── */}
+      {/* Toast */}
       {toast && (
         <div className={`rounded-2xl px-4 py-3 flex items-center justify-between text-sm font-medium ${
           toast.ok ? 'bg-green-50 border border-green-200 text-green-800'
@@ -406,13 +339,12 @@ export default function ReportsPage() {
         </div>
       )}
 
-      {/* ── Summary cards ── */}
+      {/* Summary */}
       {attendances.length > 0 && (
-        <div className="grid grid-cols-3 gap-4">
+        <div className="grid grid-cols-2 gap-4">
           {[
-            { label: 'Total Hadir',  value: presentCount,               color: 'text-green-700' },
-            { label: 'Terlambat',   value: lateCount,                  color: 'text-yellow-700' },
-            { label: 'Total Jam',   value: `${totalHours.toFixed(1)}j`, color: 'text-blue-700' },
+            { label: 'Total Hadir', value: presentCount,                color: 'text-green-700' },
+            { label: 'Total Jam',   value: `${totalHours.toFixed(1)}j`, color: 'text-blue-700'  },
           ].map(s => (
             <div key={s.label} className="bg-white rounded-2xl border border-gray-100 shadow-sm p-4 text-center">
               <p className="text-xs text-gray-500">{s.label}</p>
@@ -422,7 +354,7 @@ export default function ReportsPage() {
         </div>
       )}
 
-      {/* ── Tabel ── */}
+      {/* Tabel */}
       {attendances.length > 0 && (
         <div className="bg-white rounded-2xl shadow-sm border border-gray-100 overflow-hidden">
           <div className="overflow-x-auto">
@@ -438,39 +370,24 @@ export default function ReportsPage() {
                 {attendances.map(att => (
                   <tr key={att.id} className="hover:bg-gray-50">
                     <td className="px-4 py-3 font-medium text-gray-900">{att.users.name}</td>
-                    <td className="px-4 py-3 text-gray-600">
-                      {format(new Date(att.check_in_time), 'd MMM', { locale: id })}
-                    </td>
-                    <td className="px-4 py-3 text-gray-600">
-                      {format(new Date(att.check_in_time), 'HH:mm')}
-                    </td>
-                    <td className="px-4 py-3 text-gray-600">
-                      {att.check_out_time ? format(new Date(att.check_out_time), 'HH:mm') : '-'}
-                    </td>
-                    <td className="px-4 py-3 text-gray-600 font-mono">
-                      {att.total_hours ? att.total_hours.toFixed(1) : '-'}
-                    </td>
+                    <td className="px-4 py-3 text-gray-600">{format(new Date(att.check_in_time), 'd MMM', { locale: id })}</td>
+                    <td className="px-4 py-3 text-gray-600">{format(new Date(att.check_in_time), 'HH:mm')}</td>
+                    <td className="px-4 py-3 text-gray-600">{att.check_out_time ? format(new Date(att.check_out_time), 'HH:mm') : '-'}</td>
+                    <td className="px-4 py-3 text-gray-600 font-mono">{att.total_hours ? att.total_hours.toFixed(1) : '-'}</td>
                     <td className="px-4 py-3">
                       <span className={`px-2 py-0.5 rounded-full text-xs font-medium ${
-                        att.status === 'present' ? 'bg-green-100 text-green-700' :
-                        att.status === 'late'    ? 'bg-yellow-100 text-yellow-700' :
-                                                   'bg-red-100 text-red-700'
+                        att.check_in_time ? 'bg-green-100 text-green-700' : 'bg-gray-100 text-gray-500'
                       }`}>
-                        {att.status === 'present' ? 'Hadir' :
-                         att.status === 'late'    ? 'Terlambat' : 'Tdk Lengkap'}
+                        {att.check_in_time ? 'Hadir' : 'Tidak Hadir'}
                       </span>
                     </td>
                     <td className="px-4 py-3">
                       <div className="flex gap-2">
                         {att.selfie_in_url
-                          ? <button onClick={() => openSelfie(att, 'in')}
-                              className="text-xs text-blue-600 hover:underline font-medium">Masuk</button>
-                          : <span className="text-xs text-gray-300">-</span>
-                        }
+                          ? <button onClick={() => openSelfie(att, 'in')} className="text-xs text-blue-600 hover:underline font-medium">Masuk</button>
+                          : <span className="text-xs text-gray-300">-</span>}
                         {att.selfie_out_url &&
-                          <button onClick={() => openSelfie(att, 'out')}
-                            className="text-xs text-blue-600 hover:underline font-medium">Pulang</button>
-                        }
+                          <button onClick={() => openSelfie(att, 'out')} className="text-xs text-blue-600 hover:underline font-medium">Pulang</button>}
                       </div>
                     </td>
                   </tr>
@@ -481,24 +398,19 @@ export default function ReportsPage() {
         </div>
       )}
 
-      {/* ── Modal: lihat selfie ── */}
+      {/* Modal selfie */}
       {modal && (
         <div className="fixed inset-0 bg-black/85 flex items-end md:items-center justify-center z-50 p-4">
           <div className="bg-gray-900 rounded-2xl w-full max-w-sm overflow-hidden">
-            {/* Header */}
             <div className="px-4 py-3 flex items-center justify-between border-b border-gray-700">
               <div>
                 <p className="text-white text-sm font-semibold">{modal.employeeName}</p>
                 <p className="text-gray-400 text-xs">
-                  Selfie {modal.type === 'in' ? 'Masuk' : 'Pulang'} ·{' '}
-                  {format(new Date(modal.date), 'd MMM yyyy', { locale: id })}
+                  Selfie {modal.type === 'in' ? 'Masuk' : 'Pulang'} · {format(new Date(modal.date), 'd MMM yyyy', { locale: id })}
                 </p>
               </div>
-              <button onClick={() => setModal(null)}
-                className="text-gray-400 hover:text-white text-2xl leading-none">×</button>
+              <button onClick={() => setModal(null)} className="text-gray-400 hover:text-white text-2xl leading-none">×</button>
             </div>
-
-            {/* Foto */}
             <div className="bg-black aspect-square flex items-center justify-center">
               {modal.signedUrl === 'loading' ? (
                 <div className="flex flex-col items-center gap-3">
@@ -506,30 +418,23 @@ export default function ReportsPage() {
                   <p className="text-gray-400 text-sm">Memuat foto...</p>
                 </div>
               ) : (
-                <img src={modal.signedUrl} alt="Selfie"
-                  className="w-full h-full object-cover"
+                <img src={modal.signedUrl} alt="Selfie" className="w-full h-full object-cover"
                   onError={() => { showToast(false, 'Foto tidak dapat ditampilkan'); setModal(null) }} />
               )}
             </div>
-
-            {/* Tombol aksi */}
             {modal.signedUrl !== 'loading' && (
               <div className="p-4 flex gap-3">
-                {/* Download satu */}
                 <button onClick={downloadOneSelfie}
-                  className="flex-1 py-2.5 bg-blue-600 hover:bg-blue-700 text-white text-sm font-semibold rounded-xl flex items-center justify-center gap-2 transition-colors">
+                  className="flex-1 py-2.5 bg-blue-600 hover:bg-blue-700 text-white text-sm font-semibold rounded-xl flex items-center justify-center gap-2">
                   <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
-                      d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
                   </svg>
                   Download
                 </button>
-                {/* Hapus satu */}
                 <button onClick={deleteOneSelfie}
-                  className="flex-1 py-2.5 bg-red-600 hover:bg-red-700 text-white text-sm font-semibold rounded-xl flex items-center justify-center gap-2 transition-colors">
+                  className="flex-1 py-2.5 bg-red-600 hover:bg-red-700 text-white text-sm font-semibold rounded-xl flex items-center justify-center gap-2">
                   <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
-                      d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
                   </svg>
                   Hapus Foto Ini
                 </button>
@@ -539,7 +444,7 @@ export default function ReportsPage() {
         </div>
       )}
 
-      {/* ── Modal: konfirmasi hapus semua ── */}
+      {/* Modal bulk delete */}
       {showBulkDeleteModal && (
         <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50 p-4">
           <div className="bg-white rounded-2xl w-full max-w-sm shadow-xl p-6">
@@ -551,13 +456,10 @@ export default function ReportsPage() {
             </div>
             <h3 className="text-center font-bold text-gray-900 mb-2">Hapus Semua Selfie?</h3>
             <p className="text-center text-sm text-gray-500 mb-1">
-              <span className="font-semibold text-gray-800">{selfieCount} foto</span> dari bulan{' '}
-              <span className="font-semibold text-gray-800">{monthLabel}</span>
-              {selectedEmployee ? ' untuk karyawan yang dipilih' : ''} akan dihapus permanen dari Supabase Storage.
+              <span className="font-semibold text-gray-800">{selfieCount} foto</span> periode{' '}
+              <span className="font-semibold text-gray-800">{periodLabel}</span> akan dihapus permanen.
             </p>
-            <p className="text-center text-xs text-gray-400 mb-6">
-              Data absensi (jam masuk/pulang) tidak ikut terhapus.
-            </p>
+            <p className="text-center text-xs text-gray-400 mb-6">Data absensi tidak ikut terhapus.</p>
             <div className="flex gap-3">
               <button onClick={() => setShowBulkDeleteModal(false)} disabled={deleting}
                 className="flex-1 py-2.5 rounded-xl border border-gray-200 text-gray-600 text-sm font-medium disabled:opacity-50">
